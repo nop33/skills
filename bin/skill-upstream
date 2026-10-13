@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""skill-upstream - track skills adopted from other people's repos.
+
+An adopted skill has an UPSTREAM file next to its SKILL.md:
+
+    repo: https://github.com/cursor/plugins
+    path: pstack/skills/unslop
+    commit: <full sha of the version adopted>
+    adopted: 2026-10-13
+
+Three versions of each file decide what an update does:
+    base    upstream at the adopted commit
+    theirs  upstream now (default branch)
+    mine    the copy in this roll
+
+Files only in this roll (UPSTREAM, LICENSE, your additions) are never touched.
+
+Commands:
+  status [skill...]        which adopted skills changed upstream, and which I edited
+  diff <skill>             upstream changes since adoption, then my edits
+  update <skill>           apply upstream changes; three-way merge where I edited
+  adopt <repo> <path>      copy a skill folder from a repo into this roll
+
+Needs git and network access to the upstream repos. Nothing is committed;
+review with `git -C ~/.agents diff` and commit yourself.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+ROLL = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SKILLS = os.path.join(ROLL, "skills")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "skill-upstream")
+LOCAL_ONLY = {"UPSTREAM", "LICENSE"}
+
+
+def die(msg, code=2):
+    print(f"skill-upstream: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(*args, cwd=None, check=True, binary=False):
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=not binary)
+    if check and p.returncode != 0:
+        err = p.stderr.decode() if binary else p.stderr
+        die(f"git {' '.join(args)} failed: {err.strip()}")
+    return p
+
+
+def read_upstream(skill):
+    path = os.path.join(SKILLS, skill, "UPSTREAM")
+    if not os.path.isfile(path):
+        return None
+    info = {}
+    with open(path) as f:
+        for line in f:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                info[key.strip()] = value.strip()
+    missing = {"repo", "path", "commit"} - info.keys()
+    if missing:
+        die(f"{path} is missing {', '.join(sorted(missing))}. Expected lines like 'repo: <url>'.")
+    return info
+
+
+def write_upstream(skill, info):
+    lines = [f"{k}: {info[k]}" for k in ("repo", "path", "commit", "adopted") if k in info]
+    with open(os.path.join(SKILLS, skill, "UPSTREAM"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def mirror(repo):
+    """Blobless bare clone of repo, fetched fresh. Returns its directory."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", re.sub(r"^\w+://", "", repo)).strip("-")
+    d = os.path.join(CACHE, slug)
+    if not os.path.isdir(d):
+        os.makedirs(CACHE, exist_ok=True)
+        git("clone", "--quiet", "--bare", "--filter=blob:none", repo, d)
+    else:
+        git("fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*", cwd=d)
+    return d
+
+
+def head(d):
+    return git("rev-parse", "HEAD", cwd=d).stdout.strip()
+
+
+def tree(d, commit, path):
+    """{relative file path: bytes} for path at commit."""
+    names = git("ls-tree", "-r", "--name-only", commit, "--", path + "/", cwd=d).stdout.split("\n")
+    files = {}
+    for name in filter(None, names):
+        files[os.path.relpath(name, path)] = git("show", f"{commit}:{name}", cwd=d, binary=True).stdout
+    return files
+
+
+def local(skill):
+    root = os.path.join(SKILLS, skill)
+    files = {}
+    for dirpath, _, names in os.walk(root):
+        for name in names:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            with open(full, "rb") as f:
+                files[rel] = f.read()
+    return files
+
+
+def adopted_skills():
+    if not os.path.isdir(SKILLS):
+        return []
+    return sorted(s for s in os.listdir(SKILLS) if os.path.isfile(os.path.join(SKILLS, s, "UPSTREAM")))
+
+
+def require_adopted(skill):
+    info = read_upstream(skill)
+    if info is None:
+        known = ", ".join(adopted_skills()) or "none"
+        die(f"'{skill}' has no UPSTREAM file in {SKILLS}. Adopted skills: {known}.")
+    return info
+
+
+def compare(skill):
+    info = require_adopted(skill)
+    d = mirror(info["repo"])
+    now = head(d)
+    base = tree(d, info["commit"], info["path"])
+    theirs = tree(d, now, info["path"]) if now != info["commit"] else base
+    mine = {k: v for k, v in local(skill).items() if k not in LOCAL_ONLY or k in base}
+    upstream_changed = sorted(f for f in base.keys() | theirs.keys() if base.get(f) != theirs.get(f))
+    edited = sorted(f for f in base.keys() | mine.keys() if base.get(f) != mine.get(f))
+    commits = []
+    if upstream_changed:
+        log = git("log", "--format=%h %cs %s", f"{info['commit']}..{now}", "--", info["path"], cwd=d).stdout
+        commits = [l for l in log.split("\n") if l]
+    return info, d, now, base, theirs, mine, upstream_changed, edited, commits
+
+
+def cmd_status(args):
+    skills = args.skills or adopted_skills()
+    if not skills:
+        print("no adopted skills (no skills/*/UPSTREAM files)")
+        return
+    report = []
+    for skill in skills:
+        info, _, now, _, _, _, changed, edited, commits = compare(skill)
+        report.append({
+            "skill": skill,
+            "upstream": info["repo"] + "/" + info["path"],
+            "adopted_commit": info["commit"][:12],
+            "upstream_commit": now[:12],
+            "upstream_changed_files": changed,
+            "upstream_commits": commits,
+            "locally_edited_files": edited,
+        })
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+    for r in report:
+        up = f"{len(r['upstream_commits'])} new commit(s)" if r["upstream_changed_files"] else "unchanged"
+        mine = f"edited: {', '.join(r['locally_edited_files'])}" if r["locally_edited_files"] else "not edited"
+        print(f"{r['skill']}: upstream {up}; {mine}")
+        for c in r["upstream_commits"]:
+            print(f"    {c}")
+    if any(r["upstream_changed_files"] for r in report):
+        print("\nRead the changes with `skill-upstream diff <skill>`, apply with `skill-upstream update <skill>`.")
+
+
+def cmd_diff(args):
+    info, d, now, base, _, mine, changed, edited, _ = compare(args.skill)
+    if changed:
+        print(f"# upstream since adoption ({info['commit'][:12]}..{now[:12]})", flush=True)
+        subprocess.run(["git", "--no-pager", "diff", "--stat", "-p", info["commit"], now, "--", info["path"]], cwd=d)
+    else:
+        print("# upstream: no changes since adoption")
+    if edited:
+        print("\n# my edits (adopted version -> my copy)", flush=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            for side, files in (("adopted", base), ("mine", mine)):
+                for rel in edited:
+                    if rel in files:
+                        p = os.path.join(tmp, side, rel)
+                        os.makedirs(os.path.dirname(p), exist_ok=True)
+                        with open(p, "wb") as f:
+                            f.write(files[rel])
+            os.makedirs(os.path.join(tmp, "adopted"), exist_ok=True)
+            os.makedirs(os.path.join(tmp, "mine"), exist_ok=True)
+            subprocess.run(["git", "--no-pager", "diff", "--no-index", "adopted", "mine"], cwd=tmp)
+    else:
+        print("\n# my edits: none")
+
+
+def cmd_update(args):
+    info, _, now, base, theirs, mine, changed, edited, commits = compare(args.skill)
+    if not changed:
+        print(f"{args.skill}: upstream unchanged since {info['commit'][:12]}, nothing to do")
+        return
+    root = os.path.join(SKILLS, args.skill)
+    conflicts, notes = [], []
+    for rel in sorted(base.keys() | theirs.keys()):
+        b, t, m = base.get(rel), theirs.get(rel), mine.get(rel)
+        target = os.path.join(root, rel)
+        if b == t:
+            continue
+        if m == b:
+            if t is None:
+                os.remove(target)
+                notes.append(f"deleted {rel} (removed upstream)")
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as f:
+                    f.write(t)
+                notes.append(f"took upstream {rel}")
+        elif t is None:
+            notes.append(f"kept {rel}: removed upstream but I edited it, decide yourself")
+        elif m is None:
+            notes.append(f"skipped {rel}: I deleted it, upstream changed it, decide yourself")
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = []
+                for name, content in (("mine", m), ("base", b or b""), ("theirs", t)):
+                    p = os.path.join(tmp, name)
+                    with open(p, "wb") as f:
+                        f.write(content)
+                    paths.append(p)
+                p = subprocess.run(["git", "merge-file", "-p", "-L", "mine", "-L", "adopted", "-L", "upstream", *paths],
+                                   capture_output=True)
+                with open(target, "wb") as f:
+                    f.write(p.stdout)
+                if p.returncode == 0:
+                    notes.append(f"merged {rel} (my edits kept, upstream changes applied)")
+                else:
+                    conflicts.append(rel)
+    info["commit"] = now
+    write_upstream(args.skill, info)
+    for n in notes:
+        print(n)
+    print(f"UPSTREAM now at {now[:12]} ({len(commits)} upstream commit(s) applied)", flush=True)
+    if conflicts:
+        print(f"\nconflicts in: {', '.join(conflicts)}. Resolve the <<<<<<< markers, then review "
+              f"with `git -C {ROLL} diff` and commit.", file=sys.stderr)
+        sys.exit(1)
+    print(f"\nReview with `git -C {ROLL} diff skills/{args.skill}` and commit.")
+
+
+def cmd_adopt(args):
+    path = args.path.strip("/")
+    name = args.name or os.path.basename(path)
+    target = os.path.join(SKILLS, name)
+    if os.path.exists(target):
+        die(f"{target} already exists. Pass --name to adopt it under another name.")
+    d = mirror(args.repo)
+    commit = git("rev-parse", args.ref or "HEAD", cwd=d).stdout.strip()
+    files = tree(d, commit, path)
+    if "SKILL.md" not in files:
+        die(f"{args.repo} has no {path}/SKILL.md at {commit[:12]}. Check the path.")
+    for rel, content in files.items():
+        p = os.path.join(target, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(content)
+    write_upstream(name, {"repo": args.repo, "path": path, "commit": commit,
+                          "adopted": datetime.date.today().isoformat()})
+    print(f"adopted {name} from {args.repo} at {commit[:12]} into {target}")
+    print("Check the upstream repo's license. If it asks to keep a notice (MIT does), "
+          f"copy its LICENSE into {target}/. Then run install.sh and commit.")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="skill-upstream", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="which adopted skills changed upstream, and which I edited")
+    s.add_argument("skills", nargs="*")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.set_defaults(fn=cmd_status)
+    d = sub.add_parser("diff", help="upstream changes since adoption, then my edits")
+    d.add_argument("skill")
+    d.set_defaults(fn=cmd_diff)
+    u = sub.add_parser("update", help="apply upstream changes, three-way merge where I edited")
+    u.add_argument("skill")
+    u.set_defaults(fn=cmd_update)
+    a = sub.add_parser("adopt", help="copy a skill folder from a repo into this roll")
+    a.add_argument("repo", help="git URL, e.g. https://github.com/mattpocock/skills")
+    a.add_argument("path", help="skill folder inside the repo, e.g. skills/engineering/tdd")
+    a.add_argument("--name", help="folder name in this roll (default: last part of path)")
+    a.add_argument("--ref", help="branch, tag or commit (default: the repo's default branch)")
+    a.set_defaults(fn=cmd_adopt)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
