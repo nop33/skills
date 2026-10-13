@@ -7,6 +7,11 @@ An adopted skill has an UPSTREAM file next to its SKILL.md:
     path: pstack/skills/unslop
     commit: <full sha of the version adopted>
     adopted: 2026-10-13
+    files: tests.md mocking.md      <- optional: track only these files
+
+Without a files line the whole folder is tracked. With one, only the listed
+files are compared and updated, so the skill can have its own SKILL.md while
+reusing someone else's reference files.
 
 Three versions of each file decide what an update does:
     base    upstream at the adopted commit
@@ -19,7 +24,7 @@ Commands:
   status [skill...]        which adopted skills changed upstream, and which I edited
   diff <skill>             upstream changes since adoption, then my edits
   update <skill>           apply upstream changes; three-way merge where I edited
-  adopt <repo> <path>      copy a skill folder from a repo into this roll
+  adopt <repo> <path>      copy a skill folder (or --files from it) into this roll
 
 Needs git and network access to the upstream repos. Nothing is committed;
 review with `git -C ~/.agents diff` and commit yourself.
@@ -65,11 +70,14 @@ def read_upstream(skill):
     missing = {"repo", "path", "commit"} - info.keys()
     if missing:
         die(f"{path} is missing {', '.join(sorted(missing))}. Expected lines like 'repo: <url>'.")
+    info["files"] = info["files"].replace(",", " ").split() if info.get("files") else []
     return info
 
 
 def write_upstream(skill, info):
     lines = [f"{k}: {info[k]}" for k in ("repo", "path", "commit", "adopted") if k in info]
+    if info.get("files"):
+        lines.append("files: " + " ".join(info["files"]))
     with open(os.path.join(SKILLS, skill, "UPSTREAM"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -90,13 +98,23 @@ def head(d):
     return git("rev-parse", "HEAD", cwd=d).stdout.strip()
 
 
-def tree(d, commit, path):
-    """{relative file path: bytes} for path at commit."""
+def tree(d, commit, path, only=None):
+    """{relative file path: bytes} for path at commit, limited to `only` when given."""
     names = git("ls-tree", "-r", "--name-only", commit, "--", path + "/", cwd=d).stdout.split("\n")
     files = {}
     for name in filter(None, names):
-        files[os.path.relpath(name, path)] = git("show", f"{commit}:{name}", cwd=d, binary=True).stdout
+        rel = os.path.relpath(name, path)
+        if only and rel not in only:
+            continue
+        files[rel] = git("show", f"{commit}:{name}", cwd=d, binary=True).stdout
     return files
+
+
+def pathspec(info):
+    """The upstream paths this skill tracks."""
+    if info["files"]:
+        return [f"{info['path']}/{f}" for f in info["files"]]
+    return [info["path"]]
 
 
 def local(skill):
@@ -129,14 +147,18 @@ def compare(skill):
     info = require_adopted(skill)
     d = mirror(info["repo"])
     now = head(d)
-    base = tree(d, info["commit"], info["path"])
-    theirs = tree(d, now, info["path"]) if now != info["commit"] else base
-    mine = {k: v for k, v in local(skill).items() if k not in LOCAL_ONLY or k in base}
+    only = info["files"]
+    base = tree(d, info["commit"], info["path"], only)
+    theirs = tree(d, now, info["path"], only) if now != info["commit"] else base
+    if only:
+        mine = {k: v for k, v in local(skill).items() if k in only}
+    else:
+        mine = {k: v for k, v in local(skill).items() if k not in LOCAL_ONLY or k in base}
     upstream_changed = sorted(f for f in base.keys() | theirs.keys() if base.get(f) != theirs.get(f))
     edited = sorted(f for f in base.keys() | mine.keys() if base.get(f) != mine.get(f))
     commits = []
     if upstream_changed:
-        log = git("log", "--format=%h %cs %s", f"{info['commit']}..{now}", "--", info["path"], cwd=d).stdout
+        log = git("log", "--format=%h %cs %s", f"{info['commit']}..{now}", "--", *pathspec(info), cwd=d).stdout
         commits = [l for l in log.split("\n") if l]
     return info, d, now, base, theirs, mine, upstream_changed, edited, commits
 
@@ -175,7 +197,7 @@ def cmd_diff(args):
     info, d, now, base, _, mine, changed, edited, _ = compare(args.skill)
     if changed:
         print(f"# upstream since adoption ({info['commit'][:12]}..{now[:12]})", flush=True)
-        subprocess.run(["git", "--no-pager", "diff", "--stat", "-p", info["commit"], now, "--", info["path"]], cwd=d)
+        subprocess.run(["git", "--no-pager", "diff", "--stat", "-p", info["commit"], now, "--", *pathspec(info)], cwd=d)
     else:
         print("# upstream: no changes since adoption")
     if edited:
@@ -256,17 +278,21 @@ def cmd_adopt(args):
         die(f"{target} already exists. Pass --name to adopt it under another name.")
     d = mirror(args.repo)
     commit = git("rev-parse", args.ref or "HEAD", cwd=d).stdout.strip()
-    files = tree(d, commit, path)
-    if "SKILL.md" not in files:
-        die(f"{args.repo} has no {path}/SKILL.md at {commit[:12]}. Check the path.")
+    files = tree(d, commit, path, args.files)
+    wanted = args.files or ["SKILL.md"]
+    missing = [f for f in wanted if f not in files]
+    if missing:
+        die(f"{args.repo} has no {', '.join(path + '/' + f for f in missing)} at {commit[:12]}. Check the path and --files.")
     for rel, content in files.items():
         p = os.path.join(target, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(content)
     write_upstream(name, {"repo": args.repo, "path": path, "commit": commit,
-                          "adopted": datetime.date.today().isoformat()})
+                          "adopted": datetime.date.today().isoformat(), "files": args.files or []})
     print(f"adopted {name} from {args.repo} at {commit[:12]} into {target}")
+    if args.files and not os.path.exists(os.path.join(target, "SKILL.md")):
+        print(f"Only {', '.join(args.files)} are tracked. Write your own {target}/SKILL.md.")
     print("Check the upstream repo's license. If it asks to keep a notice (MIT does), "
           f"copy its LICENSE into {target}/. Then run install.sh and commit.")
 
@@ -290,6 +316,7 @@ def main():
     a.add_argument("path", help="skill folder inside the repo, e.g. skills/engineering/tdd")
     a.add_argument("--name", help="folder name in this roll (default: last part of path)")
     a.add_argument("--ref", help="branch, tag or commit (default: the repo's default branch)")
+    a.add_argument("--files", nargs="+", help="copy and track only these files from the folder, e.g. tests.md mocking.md")
     a.set_defaults(fn=cmd_adopt)
     args = ap.parse_args()
     args.fn(args)
