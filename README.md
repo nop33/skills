@@ -21,6 +21,8 @@ Rerun it after adding or removing anything. It never replaces a real file or fol
 | `skills/<name>/` | One skill per folder, in the [Agent Skills](https://agentskills.io/specification) format |
 | `bin/` | Command-line tools, called by name from skills and by me |
 | `install.sh` | Links everything into place |
+| `GLOSSARY.md` | The words I use for knives, rolls and kitchens |
+| `docs/adr/` | Decisions about how the roll works, and why |
 
 ## Skills from other people
 
