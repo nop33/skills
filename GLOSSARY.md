@@ -26,7 +26,6 @@ A knife roll that a project turns on by name instead of copying from. The same r
 
 **Kitchen**:
 One place where agents run, with its own setup, such as a laptop, a cloud agent, or an employer's workspace.
-_Avoid_: Environment, machine
 
 ## Other people's knives
 
