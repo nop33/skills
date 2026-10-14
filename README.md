@@ -1,6 +1,6 @@
-# skills
+# skills - my personal knife roll
 
-My personal agent skills, and the tools that install and maintain them. I clone this repo to `~/.agents` on every machine I work on, and add a skill only after I've read it and decided to keep it.
+The skills and tools I carry to every place I run agents. A cook brings their own knives to every restaurant, and I bring mine to every machine.
 
 ## Setup
 
